@@ -3,98 +3,67 @@ import torch
 from torch import nn
 from torch.nn import init
 
-
-
 class EMSA(nn.Module):
+    def __init__(self,
+                 dim,
+                 num_heads=8,
+                 qkv_bias=False,
+                 qk_scale=None,
+                 attn_drop=0.,
+                 proj_drop=0.,
+                 sr_ratio=1,
+                 apply_transform=False):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
 
-    def __init__(self, d_model, d_k, d_v, h,dropout=.1,H=7,W=7,ratio=3,apply_transform=True):
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
 
-        super(EMSA, self).__init__()
-        self.H=H
-        self.W=W
-        self.fc_q = nn.Linear(d_model, h * d_k)
-        self.fc_k = nn.Linear(d_model, h * d_k)
-        self.fc_v = nn.Linear(d_model, h * d_v)
-        self.fc_o = nn.Linear(h * d_v, d_model)
-        self.dropout=nn.Dropout(dropout)
+        self.sr_ratio = sr_ratio
+        if sr_ratio > 1:
+            self.sr = nn.Conv2d(dim, dim, kernel_size=sr_ratio + 1, stride=sr_ratio, padding=sr_ratio // 2, groups=dim)
+            self.sr_norm = nn.LayerNorm(dim)
 
-        self.ratio=ratio
-        if(self.ratio>1):
-            self.sr=nn.Sequential()
-            self.sr_conv=nn.Conv2d(d_model,d_model,kernel_size=ratio+1,stride=ratio,padding=ratio//2,groups=d_model)
-            self.sr_ln=nn.LayerNorm(d_model)
+        self.apply_transform = apply_transform and num_heads > 1
+        if self.apply_transform:
+            self.transform_conv = nn.Conv2d(self.num_heads, self.num_heads, kernel_size=1, stride=1)
+            self.transform_norm = nn.InstanceNorm2d(self.num_heads)
 
-        self.apply_transform=apply_transform and h>1
-        if(self.apply_transform):
-            self.transform=nn.Sequential()
-            self.transform.add_module('conv',nn.Conv2d(h,h,kernel_size=1,stride=1))
-            self.transform.add_module('softmax',nn.Softmax(-1))
-            self.transform.add_module('in',nn.InstanceNorm2d(h))
-
-        self.d_model = d_model
-        self.d_k = d_k
-        self.d_v = d_v
-        self.h = h
-
-        self.init_weights()
-
-
-    def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                init.kaiming_normal_(m.weight, mode='fan_out')
-                if m.bias is not None:
-                    init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                init.constant_(m.weight, 1)
-                init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                init.normal_(m.weight, std=0.001)
-                if m.bias is not None:
-                    init.constant_(m.bias, 0)
-
-    def forward(self, queries, keys, values, attention_mask=None, attention_weights=None):
-
-        b_s, nq ,c = queries.shape
-        nk = keys.shape[1]
-
-        q = self.fc_q(queries).view(b_s, nq, self.h, self.d_k).permute(0, 2, 1, 3)  # (b_s, h, nq, d_k)
-
-        if(self.ratio>1):
-            x=queries.permute(0,2,1).view(b_s,c,self.H,self.W) #bs,c,H,W
-            x=self.sr_conv(x) #bs,c,h,w
-            x=x.contiguous().view(b_s,c,-1).permute(0,2,1) #bs,n',c
-            x=self.sr_ln(x)
-            k = self.fc_k(x).view(b_s, -1, self.h, self.d_k).permute(0, 2, 3, 1)  # (b_s, h, d_k, n')
-            v = self.fc_v(x).view(b_s, -1, self.h, self.d_v).permute(0, 2, 1, 3)  # (b_s, h, n', d_v)
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        if self.sr_ratio > 1:
+            x_ = x.permute(0, 2, 1).reshape(B, C, H, W)
+            x_ = self.sr(x_).reshape(B, C, -1).permute(0, 2, 1)
+            x_ = self.sr_norm(x_)
+            kv = self.kv(x_).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         else:
-            k = self.fc_k(keys).view(b_s, nk, self.h, self.d_k).permute(0, 2, 3, 1)  # (b_s, h, d_k, nk)
-            v = self.fc_v(values).view(b_s, nk, self.h, self.d_v).permute(0, 2, 1, 3)  # (b_s, h, nk, d_v)
+            kv = self.kv(x).reshape(B, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
 
-        if(self.apply_transform):
-            att = torch.matmul(q, k) / np.sqrt(self.d_k)  # (b_s, h, nq, n')
-            att = self.transform(att) # (b_s, h, nq, n')
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        if self.apply_transform:
+            attn = self.transform_conv(attn)
+            attn = attn.softmax(dim=-1)
+            attn = self.transform_norm(attn)
         else:
-            att = torch.matmul(q, k) / np.sqrt(self.d_k)  # (b_s, h, nq, n')
-            att = torch.softmax(att, -1) # (b_s, h, nq, n')
+            attn = attn.softmax(dim=-1)
 
-
-        if attention_weights is not None:
-            att = att * attention_weights
-        if attention_mask is not None:
-            att = att.masked_fill(attention_mask, -np.inf)
-        
-        att=self.dropout(att)
-
-        out = torch.matmul(att, v).permute(0, 2, 1, 3).contiguous().view(b_s, nq, self.h * self.d_v)  # (b_s, nq, h*d_v)
-        out = self.fc_o(out)  # (b_s, nq, d_model)
-        return out
-
+        attn = self.attn_drop(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
 
 if __name__ == '__main__':
     input=torch.randn(50,64,512)
-    emsa = EMSA(d_model=512, d_k=512, d_v=512, h=8,H=8,W=8,ratio=2,apply_transform=True)
-    output=emsa(input,input,input)
+    emsa = EMSA(512, sr_ratio=2,apply_transform=True)
+    output=emsa(input,8,8)
     print(output.shape)
 
     

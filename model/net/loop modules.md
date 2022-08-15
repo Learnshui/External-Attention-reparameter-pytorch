@@ -1,7 +1,11 @@
-<1>resnet:
-<img width="700" alt="image" src="https://user-images.githubusercontent.com/63939745/184646366-a3000d5f-d91b-43d6-b9fe-dc11e73caa97.png">
+## 目录
+  
+- [1. Resnet](#1-resnet)
 
-def _make_layer(self, block, channel, block_num, stride=1):
+## 1. Resnet
+<img width="900" alt="image" src="https://user-images.githubusercontent.com/63939745/184646366-a3000d5f-d91b-43d6-b9fe-dc11e73caa97.png">
+
+      def _make_layer(self, block, channel, block_num, stride=1):
         downsample = None
         if stride != 1 or self.in_channel != channel * block.expansion:
             downsample = nn.Sequential(

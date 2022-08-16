@@ -1,8 +1,8 @@
 ## 目录
   
 - [1. Resnet](#1-resnet)
-- [2. Shufflenetv2](#1-shufflenetv2)
-
+- [2. Shufflenetv2](#2-shufflenetv2)
+- [3. Densenet](#3-densenet)
 ## 1. Resnet
 <img width="900" alt="image" src="https://user-images.githubusercontent.com/63939745/184646366-a3000d5f-d91b-43d6-b9fe-dc11e73caa97.png">
 
@@ -51,4 +51,40 @@
             nn.BatchNorm2d(output_channels),
             nn.ReLU(inplace=True)
         )
+## 3. Densenet
+<img width="826" alt="image" src="https://user-images.githubusercontent.com/63939745/184814674-1bb354bf-f46d-4989-92d7-5b7e4f783dc5.png">
+
+    class DenseNet(nn.Module):
+      def __init__(self,
+                   growth_rate: int = 32,
+                   block_config: Tuple[int, int, int, int] = (6, 12, 24, 16),
+                   num_init_features: int = 64,
+                   bn_size: int = 4,
+                   drop_rate: float = 0,
+                   num_classes: int = 2,
+                   memory_efficient: bool = False):
+          super(DenseNet, self).__init__()
+          # first conv+bn+relu+pool
+          self.features = nn.Sequential(OrderedDict([
+              ("conv0", nn.Conv2d(3, num_init_features, kernel_size=7, stride=2, padding=3, bias=False)),
+              ("norm0", nn.BatchNorm2d(num_init_features)),
+              ("relu0", nn.ReLU(inplace=True)),
+              ("pool0", nn.MaxPool2d(kernel_size=3, stride=2, padding=1)),
+          ]))
+          # each dense block
+          num_features = num_init_features
+          for i, num_layers in enumerate(block_config):
+              block = _DenseBlock(num_layers=num_layers,
+                                  input_c=num_features,
+                                  bn_size=bn_size,
+                                  growth_rate=growth_rate,
+                                  drop_rate=drop_rate,
+                                  memory_efficient=memory_efficient)
+              self.features.add_module("denseblock%d" % (i + 1), block)
+              num_features = num_features + num_layers * growth_rate
+              if i != len(block_config) - 1:
+                  trans = _Transition(input_c=num_features,
+                                      output_c=num_features // 2)
+                  self.features.add_module("transition%d" % (i + 1), trans)
+                  num_features = num_features // 2
 

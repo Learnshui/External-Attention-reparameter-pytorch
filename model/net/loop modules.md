@@ -89,3 +89,5 @@ Transition层可以产生θm个特征（通过卷积层）,θ∈(0,1] 是压缩�
                   self.features.add_module("transition%d" % (i + 1), trans)
                   num_features = num_features // 2
 
+## 4. 书写模式
+<img width="500" alt="image" src="https://user-images.githubusercontent.com/63939745/184897709-1663a3da-1bb4-4654-b73f-8b46c4907a4f.png"><img width="500" alt="image" src="https://user-images.githubusercontent.com/63939745/184897807-e3b749f0-1434-4c7d-b94b-41808d057c78.png">

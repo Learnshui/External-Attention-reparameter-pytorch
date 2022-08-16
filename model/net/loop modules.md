@@ -1,7 +1,7 @@
 ## 目录
   
 - [1. Resnet](#1-resnet)
-- [2. Shufflenetv2](#1-shuttlenetv2)
+- [2. Shufflenetv2](#1-shufflenetv2)
 
 ## 1. Resnet
 <img width="900" alt="image" src="https://user-images.githubusercontent.com/63939745/184646366-a3000d5f-d91b-43d6-b9fe-dc11e73caa97.png">
@@ -36,7 +36,7 @@
         self.stage2: nn.Sequential
         self.stage3: nn.Sequential
         self.stage4: nn.Sequential
-        #这一块写得好
+        #这一块写得好 当stride为1时候，先将输入通过Channel Split在channel维度均分为两份，接着将第一个分支branch1直接与branch2cat，当stride为2时候，由于输入直接送到两个分支中，因此最终输出的channel是翻倍的
         stage_names = ["stage{}".format(i) for i in [2, 3, 4]]
         for name, repeats, output_channels in zip(stage_names, stages_repeats,
                                                   self._stage_out_channels[1:]):

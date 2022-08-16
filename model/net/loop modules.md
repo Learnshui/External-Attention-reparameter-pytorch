@@ -1,6 +1,7 @@
 ## 目录
   
 - [1. Resnet](#1-resnet)
+- [2. Shufflenetv2](#1-shuttlenetv2)
 
 ## 1. Resnet
 <img width="900" alt="image" src="https://user-images.githubusercontent.com/63939745/184646366-a3000d5f-d91b-43d6-b9fe-dc11e73caa97.png">
@@ -28,3 +29,26 @@
                                 width_per_group=self.width_per_group))
 
         return nn.Sequential(*layers)
+## 2. Shufflenetv2
+<img width="500" alt="image" src="https://user-images.githubusercontent.com/63939745/184789667-0aca772f-f138-451a-bb14-e8d688697d05.png"><img width="500" alt="image" src="https://user-images.githubusercontent.com/63939745/184789704-ce742989-50b0-4b2a-848f-85b43af9b22f.png">
+
+      # Static annotations for mypy
+        self.stage2: nn.Sequential
+        self.stage3: nn.Sequential
+        self.stage4: nn.Sequential
+        #这一块写得好
+        stage_names = ["stage{}".format(i) for i in [2, 3, 4]]
+        for name, repeats, output_channels in zip(stage_names, stages_repeats,
+                                                  self._stage_out_channels[1:]):
+            seq = [inverted_residual(input_channels, output_channels, 2)]
+            for i in range(repeats - 1):
+                seq.append(inverted_residual(output_channels, output_channels, 1))
+            setattr(self, name, nn.Sequential(*seq))
+            input_channels = output_channels
+        output_channels = self._stage_out_channels[-1]
+        self.conv5 = nn.Sequential(
+            nn.Conv2d(input_channels, output_channels, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(output_channels),
+            nn.ReLU(inplace=True)
+        )
+

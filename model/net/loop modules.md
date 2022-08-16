@@ -53,6 +53,7 @@
         )
 ## 3. Densenet
 <img width="826" alt="image" src="https://user-images.githubusercontent.com/63939745/184814674-1bb354bf-f46d-4989-92d7-5b7e4f783dc5.png">
+Transition层可以产生θm个特征（通过卷积层）,θ∈(0,1] 是压缩系数;由于密集连接方式，DenseNet提升了梯度的反向传播，使得网络更容易训练。
 
     class DenseNet(nn.Module):
       def __init__(self,

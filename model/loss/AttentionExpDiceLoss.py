@@ -1,4 +1,6 @@
 # coding:utf8
+# https://arxiv.org/pdf/2102.01897.pdf  提出一种新的硬度感知损失函数：
+#加权预测比原始预测离金标准更远，加权的较硬区域会对反向传播产生较大的影响，得到更多的改进空间，使网络更多地关注硬体素。AttentionExpDiceLoss
 import torch
 import torch.nn.functional as F
 import torch.nn as nn

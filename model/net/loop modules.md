@@ -94,29 +94,13 @@ Transition层可以产生θm个特征（通过卷积层）,θ∈(0,1] 是压缩�
 ### 书写模式一
 <img width="500" alt="image" src="https://user-images.githubusercontent.com/63939745/184897709-1663a3da-1bb4-4654-b73f-8b46c4907a4f.png"><img width="500" alt="image" src="https://user-images.githubusercontent.com/63939745/184897807-e3b749f0-1434-4c7d-b94b-41808d057c78.png">
 ### 书写模式二
-    import torch
-    import torch.nn as nn
     def conv_block(in_dim, out_dim, act_fn):
-        model = nn.Sequential(
-            nn.Conv2d(in_dim, out_dim, kernel_size=3, stride=1, padding=1),
-            nn.InstanceNorm2d(out_dim),
-            act_fn,)
+        model = nn.Sequential(nn.Conv2d(in_dim, out_dim, kernel_size=3, stride=1, padding=1),nn.InstanceNorm2d(out_dim),act_fn,)
         return model
     def up_conv(in_dim, out_dim, act_fn):
-        model = nn.Sequential(
-            nn.ConvTranspose2d(in_dim, out_dim, kernel_size=3,
-                               stride=2, padding=1, output_padding=1),
-            nn.InstanceNorm2d(out_dim),
-            act_fn,)
+        model = nn.Sequential(nn.ConvTranspose2d(in_dim, out_dim, kernel_size=3,stride=2, padding=1, output_padding=1),nn.InstanceNorm2d(out_dim),act_fn,)
         return model
-    def double_conv_block(in_dim, out_dim, act_fn):
-        model = nn.Sequential(
-            conv_block(in_dim, out_dim, act_fn),
-            conv_block(out_dim, out_dim, act_fn),)
-        return model
-    def out_block(in_dim, out_dim):
-        model = nn.Sequential(
-            nn.Conv2d(in_dim, out_dim, kernel_size=1, stride=1, padding=0))
+    def double_conv_block(in_dim, out_dim, act_fn):model = nn.Sequential(conv_block(in_dim, out_dim, act_fn),conv_block(out_dim, out_dim, act_fn),)
         return model
     class UNet(nn.Module):
       def __init__(self, in_dim, out_dim, num_filter):
@@ -127,16 +111,6 @@ Transition层可以产生θm个特征（通过卷积层）,θ∈(0,1] 是压缩�
           act_fn = nn.ReLU(inplace=True)
           self.down_1 = double_conv_block(self.in_dim, self.num_filter, act_fn)
           self.pool_1 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
-          self.down_2 = double_conv_block(
-              self.num_filter, self.num_filter * 2, act_fn)
-          self.pool_2 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
-          self.down_3 = double_conv_block(
-              self.num_filter * 2, self.num_filter * 4, act_fn)
-          self.pool_3 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
-
-          self.down_4 = double_conv_block(
-              self.num_filter * 4, self.num_filter * 8, act_fn)
-          self.pool_4 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
           ......
       def forward(self, x):
           ......

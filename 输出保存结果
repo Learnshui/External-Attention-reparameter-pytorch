@@ -1,5 +1,195 @@
+###第一种保存原图，结果图，groundtruth Ms-RED-main/main_train_tumor_lits.py
+#!/usr/bin/python3
+# these code is for ISIC 2018: Skin Lesion Analysis Towards Melanoma Segmentation
+# -*- coding: utf-8 -*-
+# @Author  : Duwei Dai
+import os
+import torch
+import math
+import visdom
+import torch.utils.data as Data
+import argparse
+import numpy as np
+import sys
+from tqdm import tqdm
+from utils.replicate import patch_replication_callback
+from distutils.version import LooseVersion
+from Datasets.ISIC2018 import ISIC2018_dataset
+from Datasets.Lits import LiTS_liver
+from utils.transform import ISIC2018_transform, ISIC2018_transform_320, ISIC2018_transform_newdata
+import cv2
+from Models.networks.ca_network import Comprehensive_Atten_Unet
+from Models.DeepLabV3Plus.network import deeplabv3plus_resnet50
+from Models.denseaspp.models.DenseASPP_ddw import DenseASPP_121
+from Models.compare_networks.BCDU_Net import BCDU_net_D3
+from Models.compare_networks.CPFNet import CPF_Net
+from Models.compare_networks.CENet import CE_Net
+from Models.networks.ms_red_models import Ms_red_v1, Ms_red_v2
 
-for step, (name,img_cur,img, lab) in tqdm(enumerate(test_loader), total=len(test_loader)):
+from utils.dice_loss import get_soft_label, val_dice_isic, SoftDiceLoss
+from utils.dice_loss import Intersection_over_Union_isic
+from utils.dice_loss_github import SoftDiceLoss_git, CrossentropyND
+
+from utils.evaluation import AverageMeter
+from utils.binary import assd, dc, jc, precision, sensitivity, specificity, F1, ACC
+from torch.optim import lr_scheduler
+
+from time import *
+
+#loss为nan？？？？？loss不为nan，但是valid结果上下起伏，65左右lossA
+# os.environ['CUDA_VISIBLE_DEVICES'] = "5,6"
+
+Test_Model = {
+              "Comp_Atten_Unet": Comprehensive_Atten_Unet,
+              "BCDU_net_D3": BCDU_net_D3,
+              "CPF_Net": CPF_Net,
+              "CE_Net": CE_Net,
+              "Ms_red_v1":Ms_red_v1,
+              "Ms_red_v2":Ms_red_v2
+             }
+             
+             
+Test_Dataset = {'Lits_tumor': LiTS_liver}
+
+Test_Transform = {'A': ISIC2018_transform, 'B':ISIC2018_transform_320, "C":ISIC2018_transform_newdata}
+
+criterion = "loss_A"  # loss_A-->SoftDiceLoss;  loss_B-->softdice;  loss_C--> CE + softdice
+
+
+class Logger(object):
+    def __init__(self,logfile):
+        self.terminal = sys.stdout
+        self.log = open(logfile, "a")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)  
+
+    def flush(self):
+        pass 
+        
+        
+def train(train_loader, model, criterion, scheduler, optimizer, args, epoch):
+    losses = AverageMeter()
+    # current_loss_f = "CE_softdice"       # softdice or CE_softdice
+    
+    model.train()
+    i=0
+    for step, (x, y) in tqdm(enumerate(train_loader), total=len(train_loader)):
+        image = x.float().cuda()                                   
+        target = y.float().cuda()                                  
+        i=i+1
+        output = model(image)                                     
+        target_soft_a = get_soft_label(target, args.num_classes)   
+        target_soft = target_soft_a.permute(0, 3, 1, 2)           
+
+        ca_soft_dice_loss = SoftDiceLoss()
+        soft_dice_loss = SoftDiceLoss_git(batch_dice=True, dc_log=False)
+        soft_dice_loss2 = SoftDiceLoss_git(batch_dice=False, dc_log=False)
+        soft_dice_loss3 = SoftDiceLoss_git(batch_dice=True, dc_log=True)
+        CE_loss_F = CrossentropyND()
+        
+        if criterion == "loss_A":
+            loss_ave, loss_lesion = ca_soft_dice_loss(output, target_soft_a, args.num_classes)     
+            loss = loss_ave
+        
+        if criterion == "loss_B":
+            dice_loss = soft_dice_loss(output, target_soft)      
+            loss = dice_loss
+        
+        if criterion == "loss_C":
+            dice_loss = soft_dice_loss2(output, target_soft)    
+            ce_loss = CE_loss_F(output, target)
+            loss = dice_loss + ce_loss  
+                 
+        loss = loss
+        losses.update(loss.data, image.size(0))
+
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        # with torch.autograd.set_detect_anomaly(True):
+        loss.backward()
+        
+        optimizer.step()
+        
+        
+        print('current lr: {} | Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {losses.avg:.6f}'.format(
+                   optimizer.state_dict()['param_groups'][0]['lr'],
+                   epoch, i * len(image), len(train_loader.dataset),
+                   100. * i / len(train_loader), losses=losses))
+                
+    print('The average loss:{losses.avg:.4f}'.format(losses=losses))
+    return losses.avg
+
+
+def valid_isic(valid_loader, model, criterion, optimizer, args, epoch, best_score, val_acc_log):
+    isic_Jaccard = []
+    isic_dc = []
+
+    model.eval()
+    for step, (t, k) in tqdm(enumerate(valid_loader), total=len(valid_loader)):
+        image = t.float().cuda()
+        target = k.float().cuda()
+
+        output = model(image)                                             # model output
+        output_dis = torch.max(output, 1)[1].unsqueeze(dim=1)
+        output_dis_test = output_dis.permute(0, 2, 3, 1).float()
+        target_test = target.permute(0, 2, 3, 1).float()
+        isic_b_Jaccard = jc(output_dis_test.cpu().numpy(), target_test.cpu().numpy())
+        isic_b_dc = dc(output_dis_test.cpu().numpy(), target_test.cpu().numpy())
+        isic_Jaccard.append(isic_b_Jaccard)
+        isic_dc.append(isic_b_dc)
+
+    isic_Jaccard_mean = np.average(isic_Jaccard)
+    isic_dc_mean = np.average(isic_dc)
+    net_score = isic_Jaccard_mean + isic_dc_mean
+        
+    print('The ISIC Dice score: {dice: .4f}; '
+          'The ISIC JC score: {jc: .4f}'.format(
+           dice=isic_dc_mean, jc=isic_Jaccard_mean))
+           
+    with open(val_acc_log, 'a') as vlog_file:
+        line = "{} | {dice: .4f} | {jc: .4f}".format(epoch, dice=isic_dc_mean, jc=isic_Jaccard_mean)
+        vlog_file.write(line+'\n')
+
+    if net_score > max(best_score):
+        best_score.append(net_score)
+        print(best_score)
+        modelname = args.ckpt + '/' + 'best_score' + '_' + args.data + '_checkpoint.pth.tar'
+        print('the best model will be saved at {}'.format(modelname))
+        state = {'epoch': epoch, 'state_dict': model.state_dict(), 'opt_dict': optimizer.state_dict()}
+        torch.save(state, modelname)
+
+    return isic_Jaccard_mean, isic_dc_mean, net_score
+
+
+def test_isic(test_loader, model, num_para, args, test_acc_log):
+    isic_dice = []
+    isic_iou = []
+   # isic_assd = []
+    isic_acc = []
+    isic_sensitive = []
+    isic_specificy = []
+    isic_precision = []
+    isic_f1_score = []
+    isic_Jaccard_M = []
+    isic_Jaccard_N = []
+    isic_Jaccard = []
+    isic_dc = []
+    infer_time = []
+    
+    modelname = args.ckpt + '/' + 'best_score' + '_' + args.data + '_checkpoint.pth.tar'
+    if os.path.isfile(modelname):
+        print("=> Loading checkpoint '{}'".format(modelname))
+        checkpoint = torch.load(modelname)
+        model.load_state_dict(checkpoint['state_dict'])
+        print("=> Loaded saved the best model at (epoch {})".format(checkpoint['epoch']))
+    else:
+        print("=> No checkpoint found at '{}'".format(modelname))
+
+    model.eval()
+    i=0
+    for step, (name,img_cur,img, lab) in tqdm(enumerate(test_loader), total=len(test_loader)):
         image = img.float().cuda()
         target = lab.float().cuda() # [batch, 1, 224, 320]
         i+=1
@@ -20,7 +210,493 @@ for step, (name,img_cur,img, lab) in tqdm(enumerate(test_loader), total=len(test
             cv2.imwrite('/home/shuiyuanyuan/Ms-RED-main/results_tumor/' + name[0][:-4] + '-image.png', img_cur)
             cv2.imwrite('/home/shuiyuanyuan/Ms-RED-main/results_tumor/' + name[0][:-4] + '-mask.png', output_save*255.0)
             cv2.imwrite('/home/shuiyuanyuan/Ms-RED-main/results_tumor/' + name[0][:-4]+ '-label.png', target_save*255.0)
+
+
+        output_dis_test = output_dis.permute(0, 2, 3, 1).float()
+        target_test = target.permute(0, 2, 3, 1).float()
+        output_soft = get_soft_label(output_dis, 2) 
+        target_soft = get_soft_label(target, 2) 
+
+        label_arr = np.squeeze(target_soft.cpu().numpy()).astype(np.uint8)
+        output_arr = np.squeeze(output_soft.cpu().byte().numpy()).astype(np.uint8)
+
+        isic_b_dice = val_dice_isic(output_soft, target_soft, 2) #包含背景和前景的值，应该只取前景的值吧即  isic_b_dice[1]                                      # the dice
+        isic_b_iou = Intersection_over_Union_isic(output_dis_test, target_test, 1)                       # the iou
+        # isic_b_asd = assd(output_arr[:, :, 1], label_arr[:, :, 1])                                     # the assd
+        isic_b_acc = ACC(output_dis_test.cpu().numpy(), target_test.cpu().numpy())                       # the accuracy
+        isic_b_sensitive = sensitivity(output_dis_test.cpu().numpy(), target_test.cpu().numpy())         # the sensitivity
+        isic_b_specificy = specificity(output_dis_test.cpu().numpy(), target_test.cpu().numpy())         # the specificity
+        isic_b_precision = precision(output_dis_test.cpu().numpy(), target_test.cpu().numpy())           # the precision
+        isic_b_f1_score = F1(output_dis_test.cpu().numpy(), target_test.cpu().numpy())                   # the F1
+        isic_b_Jaccard_m = jc(output_arr[:, :, 1], label_arr[:, :, 1])                                   # the Jaccard melanoma
+        isic_b_Jaccard_n = jc(output_arr[:, :, 0], label_arr[:, :, 0])                                   # the Jaccard no-melanoma
+        isic_b_Jaccard = jc(output_dis_test.cpu().numpy(), target_test.cpu().numpy())
+        isic_b_dc = dc(output_dis_test.cpu().numpy(), target_test.cpu().numpy())
+        
+        dice_np = isic_b_dice.data.cpu().numpy()
+        iou_np = isic_b_iou.data.cpu().numpy()
+       
+        isic_dice.append(dice_np)
+        isic_iou.append(iou_np)
+       # isic_assd.append(isic_b_asd)
+        isic_acc.append(isic_b_acc)
+        isic_sensitive.append(isic_b_sensitive)
+        isic_specificy.append(isic_b_specificy)
+        isic_precision.append(isic_b_precision)
+        isic_f1_score.append(isic_b_f1_score)
+        isic_Jaccard_M.append(isic_b_Jaccard_m)
+        isic_Jaccard_N.append(isic_b_Jaccard_n)
+        isic_Jaccard.append(isic_b_Jaccard)
+        isic_dc.append(isic_b_dc)
+        isic_dice2 =np.average(dice_np)
+
+        with open(test_acc_log, 'a') as tlog_file:
+            line = "{} | {dice: .4f} | {jc: .4f} | {dice2: .4f}".format(name[0], dice=isic_b_dc, jc=isic_b_Jaccard,dice2=isic_dice2)
+            tlog_file.write(line+'\n')
+    all_time = np.sum(infer_time)
+    isic_dice_mean = np.average(isic_dice)
+    isic_dice_std = np.std(isic_dice)
+
+    isic_iou_mean = np.average(isic_iou)
+    isic_iou_std = np.std(isic_iou)
+
+   # isic_assd_mean = np.average(isic_assd)
+   # isic_assd_std = np.std(isic_assd)
+      
+    isic_acc_mean = np.average(isic_acc)
+    isic_acc_std = np.std(isic_acc)
+    
+    isic_sensitive_mean = np.average(isic_sensitive)
+    isic_sensitive_std = np.std(isic_sensitive)
+    
+    isic_specificy_mean = np.average(isic_specificy)
+    isic_specificy_std = np.std(isic_specificy)
+    
+    isic_precision_mean = np.average(isic_precision)
+    isic_precision_std = np.std(isic_precision)
+    
+    isic_f1_score_mean = np.average(isic_f1_score)
+    iisic_f1_score_std = np.std(isic_f1_score)
+    
+    isic_Jaccard_M_mean = np.average(isic_Jaccard_M)
+    isic_Jaccard_M_std = np.std(isic_Jaccard_M)
+    
+    isic_Jaccard_N_mean = np.average(isic_Jaccard_N)
+    isic_Jaccard_N_std = np.std(isic_Jaccard_N)
+    
+    isic_Jaccard_mean = np.average(isic_Jaccard)
+    isic_Jaccard_std = np.std(isic_Jaccard)
+    
+    isic_dc_mean = np.average(isic_dc)
+    isic_dc_std = np.std(isic_dc)
+
+    print('The liver mean dice: {isic_dice_mean: .4f}; The liver dice std: {isic_dice_std: .4f}'.format(
+           isic_dice_mean=isic_dice_mean, isic_dice_std=isic_dice_std))
+    print('The livermean IoU: {isic_iou_mean: .4f}; The liver IoU std: {isic_iou_std: .4f}'.format(
+           isic_iou_mean=isic_iou_mean, isic_iou_std=isic_iou_std))
+   # print('The ISIC mean assd: {isic_assd_mean: .4f}; The ISIC assd std: {isic_assd_std: .4f}'.format(
+   #        isic_assd_mean=isic_assd_mean, isic_assd_std=isic_assd_std))
+    print('The liver mean ACC: {isic_acc_mean: .4f}; The liver ACC std: {isic_acc_std: .4f}'.format(
+           isic_acc_mean=isic_acc_mean, isic_acc_std=isic_acc_std))
+    print('The liver mean sensitive: {isic_sensitive_mean: .4f}; The liver sensitive std: {isic_sensitive_std: .4f}'.format(
+           isic_sensitive_mean=isic_sensitive_mean, isic_sensitive_std=isic_sensitive_std)) 
+    print('The liver mean specificy: {isic_specificy_mean: .4f}; The liver specificy std: {isic_specificy_std: .4f}'.format(
+           isic_specificy_mean=isic_specificy_mean, isic_specificy_std=isic_specificy_std))
+    print('The liver mean precision: {isic_precision_mean: .4f}; The liver precision std: {isic_precision_std: .4f}'.format(
+           isic_precision_mean=isic_precision_mean, isic_precision_std=isic_precision_std))
+    print('The liver mean f1_score: {isic_f1_score_mean: .4f}; The liver f1_score std: {iisic_f1_score_std: .4f}'.format(
+           isic_f1_score_mean=isic_f1_score_mean, iisic_f1_score_std=iisic_f1_score_std))
+    print('The liver mean Jaccard_M: {isic_Jaccard_M_mean: .4f}; The liver Jaccard_M std: {isic_Jaccard_M_std: .4f}'.format(
+           isic_Jaccard_M_mean=isic_Jaccard_M_mean, isic_Jaccard_M_std=isic_Jaccard_M_std))
+    print('The liver mean Jaccard_N: {isic_Jaccard_N_mean: .4f}; The liver Jaccard_N std: {isic_Jaccard_N_std: .4f}'.format(
+           isic_Jaccard_N_mean=isic_Jaccard_N_mean, isic_Jaccard_N_std=isic_Jaccard_N_std))
+    print('The liver mean Jaccard: {isic_Jaccard_mean: .4f}; The liver Jaccard std: {isic_Jaccard_std: .4f}'.format(
+           isic_Jaccard_mean=isic_Jaccard_mean, isic_Jaccard_std=isic_Jaccard_std))
+    print('The liver mean dc: {isic_dc_mean: .4f}; The liver dc std: {isic_dc_std: .4f}'.format(
+           isic_dc_mean=isic_dc_mean, isic_dc_std=isic_dc_std))
+    print('The inference time: {time: .4f}'.format(time=all_time))
+    print("Number of trainable parameters {0} in Model {1}".format(num_para, args.id))
+    
+    
+def main(args, val_acc_log, test_acc_log):
+    best_score = [0]
+    start_epoch = args.start_epoch
+    print('loading the {0},{1},{2} dataset ...'.format('train', 'vaild', 'test'))
+    trainset = Test_Dataset[args.data](dataset_folder=args.root_path, folder=args.val_folder, mode='train',with_name=False)
+    validset = Test_Dataset[args.data](dataset_folder=args.root_path, folder=args.val_folder, mode='val',with_name=False)
+    testset =  Test_Dataset[args.data](dataset_folder=args.root_path_test, folder=args.val_folder, mode='test',with_name=True)
+
+    trainloader = Data.DataLoader(dataset=trainset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=6)
+    validloader = Data.DataLoader(dataset=validset, batch_size=1, shuffle=False, pin_memory=True, num_workers=6)
+    testloader = Data.DataLoader(dataset=testset, batch_size=1, shuffle=False, pin_memory=True, num_workers=6)
+    print('Loading is done\n')
+
+    args.num_input = 3
+    args.num_classes = 2
+    args.out_size = (448, 448)
+
+    if args.id =="Comp_Atten_Unet":
+        model = Test_Model[args.id](args, args.num_input, args.num_classes)
+
+    elif args.id =="DenseASPP_121":
+        model = DenseASPP_121(n_class=2, output_stride=8)              
+   
+    elif args.id =="deeplabv3plus_resnet50":
+        model = deeplabv3plus_resnet50(num_classes=2)  
+    else:
+        model = Test_Model[args.id](classes=2, channels=3)
+
+    model = model.cuda()
+    # args.cuda = not args.no_cuda and torch.cuda.is_available()
+    # if args.cuda:
+    #     try:
+    #         args.gpu_ids = [int(s) for s in args.gpu_ids.split(',')]
+    #     except ValueError:
+    #         raise ValueError('Argument --gpu_ids must be a comma-separated list of integers only')
+    # if args.cuda:
+    #         model = torch.nn.DataParallel(model, device_ids=args.gpu_ids)
+    #         patch_replication_callback(model)
+    #         model = model.cuda()
+
+    print("------------------------------------------")
+    print("Network Architecture of Model {}:".format(args.id))
+    num_para = 0
+    for name, param in model.named_parameters():
+        num_mul = 1
+        for x in param.size():
+            num_mul *= x
+        num_para += num_mul
+    # print(model)
+    print("Number of trainable parameters {0} in Model {1}".format(num_para, args.id))
+    print("------------------------------------------")
+
+    # Define optimizers and loss function
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr_rate, weight_decay=args.weight_decay)    
+   # scheduler = lr_scheduler.StepLR(optimizer, step_size=70, gamma=0.5)                                    # lr_1
+   # scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min = 0.0001)     # lr_2
+    scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min = 0.00001)    # lr_3
+   # scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=1, eta_min = 0.00001)  # lr_4
+
+    # resume
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> Loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume)
+            start_epoch = checkpoint['epoch']
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['opt_dict'])
+            print("=> Loaded checkpoint (epoch {})".format(checkpoint['epoch']))
+        else:
+            print("=> No checkpoint found at '{}'".format(args.resume))
+
+    print("Start training ...")
+    # for epoch in range(start_epoch+1, args.epochs + 1):
+    #     scheduler.step()
+    #     train_avg_loss = train(trainloader, model, criterion, scheduler, optimizer, args, epoch)
+    #     isic_Jaccard_mean, isic_dc_mean, net_score = valid_isic(validloader, model, criterion, optimizer, args, epoch, best_score, val_acc_log)
+    #     if epoch > args.particular_epoch:
+    #         if epoch % args.save_epochs_steps == 0:
+    #             filename = args.ckpt + '/' + str(epoch) + '_' + args.data + '_checkpoint.pth.tar'
+    #             print('the model will be saved at {}'.format(filename))
+    #             state = {'epoch': epoch, 'state_dict': model.state_dict(), 'opt_dict': optimizer.state_dict()}
+    #             torch.save(state, filename)
+
+    # print('Training Done! Start testing')
+    if args.data == 'Lits_tumor':
+        test_isic(testloader, model, num_para, args, test_acc_log)
+    print('Testing Done!')
+    
+    
+if __name__ == '__main__':
+
+    """
+    This project supports the following models:
+    compared methods：
+        Comp_Atten_Unet:                      ca-net                                  ** 4134 ***
+        DenseASPP_121                                                                 ** 6985 ***  
+        deeplabv3plus_resnet50:              without pretrain                         ** 5809 ***
+        BCDU_net_D3                          batch_size=4, lr_rate = 1e-4
+        CPF_Net
+        CE_Net
+
+    Ms-RED_famaily:
+        Ms_red_v1                                                                     ** 9937 ***  our Ms RED V1
+        Ms_red_v2                                                                     ** 10889 *** our Ms RED V2                           
+    """
+    
+    os.environ['CUDA_VISIBLE_DEVICES']= '5'                                                 # gpu-id
+    
+    assert LooseVersion(torch.__version__) >= LooseVersion('0.4.0'), 'PyTorch>=0.4.0 is required'
+    parser = argparse.ArgumentParser(description='Comprehensive attention network for biomedical Dataset')
+    
+    parser.add_argument('--id', default="Ms_red_v1",
+                        help='Ms_red_v1')                                                   # Select a loaded model name
+
+    # Path related arguments
+    parser.add_argument('--root_path', default='/home/datacenter/hdd/data_dadong/Lits_dataset_crop/trainingset',
+                        help='root directory of data')      
+    parser.add_argument('--root_path_test', default='/home/datacenter/hdd/data_dadong/Lits_dataset_crop/validset',
+                        help='root directory of data')                                  # The folder where the numpy data set is stored
+    parser.add_argument('--ckpt', default='/home/shuiyuanyuan/Ms-RED-main/saved_models/',
+                        help='folder to output checkpoints')                                # The folder in which the trained model is saved
+    parser.add_argument('--transform', default='C', type=str,
+                        help='which ISIC2018_transform to choose')                         
+    parser.add_argument('--data', default='Lits_tumor', help='choose the dataset')            
+    parser.add_argument('--out_size', default=(448, 448), help='the output image size')
+    parser.add_argument('--val_folder', default='folder3', type=str,
+                        help='folder1、folder2、folder3、folder4、folder5')                 # five-fold cross-validation
+
+    # optimization related arguments
+    parser.add_argument('--epochs', type=int, default=100, metavar='N',
+                        help='number of epochs to train (default: 10)')
+    parser.add_argument('--start_epoch', default=0, type=int,
+                        help='epoch to start training. useful if continue from a checkpoint')
+    parser.add_argument('--batch_size', type=int, default=8, metavar='N',              
+                        help='input batch size for training (default: 12)')                 # batch_size
+    parser.add_argument('--lr_rate', type=float, default=1e-3, metavar='LR',
+                        help='learning rate (default: 0.001)')  
+    parser.add_argument('--no_cuda', action='store_true', default=
+                        False, help='disables CUDA training')
+    parser.add_argument('--gpu-ids', type=str, default='0,1',
+                        help='use which gpu to train, must be a \
+                        comma-separated list of integers only (default=0)')                            
+    parser.add_argument('--num_classes', default=2, type=int,
+                        help='number of classes')
+    parser.add_argument('--num_input', default=3, type=int,
+                        help='number of input image for each patient')
+    parser.add_argument('--weight_decay', default=1e-8, type=float, help='weights regularizer')
+    parser.add_argument('--particular_epoch', default=20, type=int,
+                        help='after this number, we will save models more frequently')
+    parser.add_argument('--save_epochs_steps', default=200, type=int,
+                        help='frequency to save models after a particular number of epochs')
+    parser.add_argument('--resume', default='',
+                        help='the checkpoint that resumes from')
+
+    args = parser.parse_args()
+    
+    args.ckpt = os.path.join(args.ckpt, args.data, args.val_folder, args.id + "_{}".format(criterion))    
+    if not os.path.isdir(args.ckpt):
+        os.makedirs(args.ckpt)
+    logfile = os.path.join(args.ckpt,'{}_{}_{}.txt'.format(args.val_folder, args.id, criterion))          # path of the training log
+    sys.stdout = Logger(logfile)  
+    
+    val_acc_log = os.path.join(args.ckpt,'val_acc_{}_{}_{}.txt'.format(args.val_folder, args.id, criterion))   
+    test_acc_log = os.path.join(args.ckpt,'test_acc_{}_{}_{}.txt'.format(args.val_folder, args.id, criterion))    
+    
+    print('Models are saved at %s' % (args.ckpt))
+    print("Input arguments:")
+    for key, value in vars(args).items():
+        print("{:16} {}".format(key, value))
+
+    if args.start_epoch > 1:
+        args.resume = args.ckpt + '/' + str(args.start_epoch) + '_' + args.data + '_checkpoint.pth.tar'
+
+    main(args, val_acc_log, test_acc_log)
+
            
-           
+###MSNet-main/test_Ms_red_tumor.py 第二种保存原图，结果图，groundtruth
+import torch
+import torch.nn as nn
+import torch.utils.data as data
+from torch.autograd import Variable as V
+
+import sklearn.metrics as metrics
+import cv2
+import os
+import numpy as np
+
+from time import time
+from PIL import Image
+import glob
+from model.miccai_msnet import MSNet, LossNet
+from Models.networks.ms_red_models import Ms_red_v1
+import warnings
+import torch.nn.functional as F
+warnings.filterwarnings('ignore')
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '6'
+BATCHSIZE_PER_CARD = 8
+
+
+def calculate_auc_test(prediction, label):
+    # read images
+    # convert 2D array into 1D array
+    result_1D = prediction.flatten()
+    label_1D = label.flatten()
+
+
+    label_1D = label_1D / 255
+
+    auc = metrics.roc_auc_score(label_1D, result_1D)
+
+    # print("AUC={0:.4f}".format(auc))
+
+    return auc
+
+def accuracy(pred_mask, label):
+    '''
+    acc=(TP+TN)/(TP+FN+TN+FP)
+    '''
+    pred_mask = pred_mask.astype(np.uint8)#转变类型
+    TP, FN, TN, FP = [0, 0, 0, 0]
+    for i in range(label.shape[0]):
+        for j in range(label.shape[1]):
+            if label[i][j] == 1:
+                if pred_mask[i][j] == 1:
+                    TP += 1
+                elif pred_mask[i][j] == 0:
+                    FN += 1
+            elif label[i][j] == 0:
+                if pred_mask[i][j] == 1:
+                    FP += 1
+                elif pred_mask[i][j] == 0:
+                    TN += 1
+    acc = (TP + TN) / (TP + FN + TN + FP)
+    sen = (TP+1e-6) / (TP + FN+1e-6)
+    dice = (2*TP + 1.0)/(FP + FN + 2*TP + 1.0)
+    return acc, sen,dice
+
+def read_lits_validset(root_path):
+    root_path = root_path + '/img'
+    # fold = os.listdir(root_path)
+    img_list = []
+    label_list = []
+    
+    # val_list = root_path.replace('trainingset', 'validset')
+    fold_s = os.listdir(root_path)
+
+    for item in fold_s:
+        img_list += (glob.glob(os.path.join(root_path, item) + '/*.npy'))
+        img_list = sorted(img_list, key=lambda x: (int(x.split('/')[-2].split('-')[-1]), int(x.split('-')[-1].split('.')[0])))
+    label_list = [x.replace('img', 'gt').replace('volume', 'segmentation') for x in img_list]
+    # print(img_list)
+    # print(label_list)
+    return img_list, label_list
+
+
+class TTAFrame():
+    def __init__(self, net):
+        self.net = net(1,3).cuda()
+        # self.net = torch.nn.DataParallel(self.net, device_ids=range(torch.cuda.device_count()))
+
+    def test_one_img_from_path(self, path, evalmode=True):
+        if evalmode:
+            self.net.eval()
+        batchsize = torch.cuda.device_count() * BATCHSIZE_PER_CARD
+        # print('******batchsize********', batchsize)
+
+        return self.test_one_img_lits(path)
+
+    def test_one_img_lits(self, path): ###
+        # img = cv2.imread(path)  # .transpose(2,0,1)[None]
+        img0 = np.load(path)
+        img0  = cv2.resize(img0, (448,448), cv2.INTER_LINEAR)
+        img = np.stack((img0,img0,img0), axis=2) #堆叠的都是同一个切片的相应变换(448,448,3)
+        img90 = np.array(np.rot90(img))
+        img1 = np.concatenate([img[None], img90[None]])#(2,448,448,3)
+        img2 = np.array(img1)[:, ::-1] #(2,448,448,3)
+        img3 = np.concatenate([img1, img2])#(4,448,448,3)
+        img4 = np.array(img3)[:, :, ::-1]#(4,448,448,3)
+        img5 = np.concatenate([img3, img4]).transpose(0, 3, 1, 2)##(8,3,448,448)
+        img5 = np.array(img5, np.float32) / 100.0 ##(8,3,448,448)
+        img5 = V(torch.Tensor(img5).cuda())#(8,3,448,448)
+
+        mask= self.net.forward(img5)#mask,_ = self.net.forward(img5) (8,1,448,448)
+        # mask = F.sigmoid(mask)
+        mask = mask.squeeze().cpu().data.numpy()  # .squeeze(1)（8，448，448）
+        #mask = self.net.forward(img5)
+        mask1 = mask[:4] + mask[4:, :, ::-1] #（4，448，448）
+        mask2 = mask1[:2] + mask1[2:, ::-1]#（2，448，448）
+        mask3 = mask2[0] + np.rot90(mask2[1])[::-1, ::-1] #（448，448）
+
+        return img0,mask3
+
+    def load(self, path):
+        model = torch.load(path)
+        self.net.load_state_dict(model,strict=False)#pang strict=
+        #self.net.load_state_dict(model)
+
+
+def test_tanet_lits():
+    source = '/home/datacenter/hdd/data_dadong/Lits_dataset_crop/validset'
+    relog = open('/home/shuiyuanyuan/MSNet-main/test_results_lits/Evaluation_Ms_red_tumor_metrics.log','a+')
+    img_list, label_list = read_lits_validset(source)
+    # val = os.listdir(source)
+    
+    solver = TTAFrame(Ms_red_v1)
+    #solver.load('weights/CE-NetDRIVE_normal.th')
+    solver.load('/home/shuiyuanyuan/MSNet-main/Ms_red_tumor_checkpoint/100_checkpoint.pth')
+    #solver.load('weights/TA-Net_noAugDRIVE_plus_spatial_multi.th')
+    tic = time()
+    #target = 'results_Colon_test_cenet/'
+    #target = 'results_Colon_test_channel_spatial_multi/'
+    target = '/home/shuiyuanyuan/MSNet-main/test_results_lits/Ms_red_tumorNet/'
+
+    if not os.path.exists(target):
+        os.mkdir(target)
+    # gt_root = '/home/datacenter/ssd1/data_dadong/New_Lits_dataset_tumor/validaset'
+    total_m1 = 0
+
+    hausdorff = 0
+    total_acc = []
+    total_sen = []
+    total_dice = []
+    threshold = 0.2
+    disc = 0.2
+    total_auc = []
+
+    for i, slice in enumerate(img_list[30:60]):  #10个切片
+
+        img,mask = solver.test_one_img_from_path(slice) #（448，448）
+        # mask = mask * 255.0 #pang
+        # new_mask = mask.copy()
+        mask = mask / 8.0
+        mask[mask > threshold] = 1
+        mask[mask <= threshold] = 0
+        # mask = np.concatenate([mask[:, :, None], mask[:, :, None], mask[:, :, None]], axis=2)
+
+        # ground_truth_path = os.path.join(gt_root, name.split('_')[0] + '_manual1.gif')
+
+        # print(ground_truth_path)
+        ground_truth_path = slice.replace('img','gt').replace('volume','segmentation')
+        # ground_truth = np.array(Image.open(ground_truth_path))
+        ground_truth = np.load(ground_truth_path) #（512，512）
+        # ground_truth = cv2.resize(ground_truth, (448,448), cv2.INTER_NEAREST)
+        ground_truth[ground_truth<2]=0
+        ground_truth[ground_truth>=2]=1
+
+        mask = cv2.resize(mask, dsize=(np.shape(ground_truth)[1], np.shape(ground_truth)[0]))
+        #（512，512）
+        # new_mask = cv2.resize(new_mask, dsize=(np.shape(ground_truth)[1], np.shape(ground_truth)[0]))
+        # total_auc.append(calculate_auc_test(new_mask / 8., ground_truth))
+
+        # predi_mask = np.zeros(shape=np.shape(mask))
+        # predi_mask[mask > disc] = 1
+        # gt = np.zeros(shape=np.shape(ground_truth))
+        # gt[ground_truth > 0] = 1
+
+        acc,sen,dice = accuracy(mask, ground_truth)
+        total_acc.append(acc)
+        total_sen.append(sen)
+        total_dice.append(dice)
+
+        print('The {} image--Accuracy:{},Dice coeff:{}'.format(i + 1, acc, dice))
+        cv2.imwrite(target + slice.split('/')[-1].split('.')[0] + '-image.png', img)
+        cv2.imwrite(target + slice.split('/')[-1].split('.')[0] + '-mask.png', mask*255.0)
+        cv2.imwrite(target + slice.split('/')[-1].split('.')[0] + '-label.png', ground_truth*255.0)
+    print(np.mean(total_acc), np.std(total_acc))
+    print(np.mean(total_sen), np.std(total_sen))
+    print(np.mean(total_dice), np.std(total_dice))
+    #print(np.mean(total_auc), np.std(total_auc))
+    relog.write('Ms_red_tumorNet metrics: \n')
+    relog.write('Mean accuracy: {}--Mean Std: {} \n'.format(np.mean(total_acc), np.std(total_acc)))
+    relog.write('Mean sencitivity: {}--Mean Std: {} \n'.format(np.mean(total_sen), np.std(total_sen)))
+    relog.write('Mean dice: {}--Mean Std: {} \n'.format(np.mean(total_dice), np.std(total_dice)))
+
+
+if __name__ == '__main__':
+    # test_ce_net_vessel() 
+    test_tanet_lits()
+
 
 

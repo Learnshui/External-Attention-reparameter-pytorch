@@ -1,0 +1,26 @@
+
+for step, (name,img_cur,img, lab) in tqdm(enumerate(test_loader), total=len(test_loader)):
+        image = img.float().cuda()
+        target = lab.float().cuda() # [batch, 1, 224, 320]
+        i+=1
+        begin_time = time()
+        output = model(image)
+        end_time = time()
+        pred_time = end_time - begin_time
+        infer_time.append(pred_time)
+        
+        output_dis = torch.max(output, 1)[1].unsqueeze(dim=1)
+        output_save=output_dis
+        # output_save[output_save>=0.4]=1
+        # output_save[output_save<0.4]=0
+        img_cur=img_cur.squeeze().data.cpu().numpy().astype(np.uint8)
+        output_save = output_save.squeeze().data.cpu().numpy().astype(np.uint8)
+        target_save = target.squeeze().data.cpu().numpy().astype(np.uint8)
+        if i<30 or 140<=i<=170:
+            cv2.imwrite('/home/shuiyuanyuan/Ms-RED-main/results_tumor/' + name[0][:-4] + '-image.png', img_cur)
+            cv2.imwrite('/home/shuiyuanyuan/Ms-RED-main/results_tumor/' + name[0][:-4] + '-mask.png', output_save*255.0)
+            cv2.imwrite('/home/shuiyuanyuan/Ms-RED-main/results_tumor/' + name[0][:-4]+ '-label.png', target_save*255.0)
+           
+           
+
+

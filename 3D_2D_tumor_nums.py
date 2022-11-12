@@ -1,4 +1,6 @@
 #https://blog.csdn.net/a563562675/article/details/107066836
+还可以获取3D连通域对象对每个连通域进行属性获取和操作，比如计算面积、外接矩形、凸包面积等。
+#https://www.cnblogs.com/zzc-Andy/p/16731034.html 
 from skimage import measure
 import SimpleITK as sitk
 def connected_component(image):

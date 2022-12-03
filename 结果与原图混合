@@ -1,0 +1,38 @@
+#transfuse代码中，输入为原图和分割二值图
+import os
+
+from PIL import Image
+import imageio
+import numpy as np
+import matplotlib.image as mp
+import os
+import matplotlib.pyplot as plt
+
+img = Image.open(r'D:\TransFuse-lits\results\rendergraph\img2.png').convert('L')
+img = img.resize((224, 224), Image.BILINEAR)
+mp.imsave(r'D:\TransFuse-lits\results\rendergraph\img2.png', img, cmap='gray')
+#
+# for i in os.listdir(r'D:\TransFuse-lits\results\rendergraph'):
+#     image = Image.open(os.path.join(r'D:\TransFuse-lits\results\rendergraph', i)).convert('L')
+#     image = np.array(image)
+#     mp.imsave(os.path.join(r'D:\TransFuse-lits\results\rendergraph', i.replace('.png', '.png')), image, cmap='gray')
+
+img = Image.open(r'D:\TransFuse-lits\results\rendergraph\img2.png').convert('RGBA')
+# img = img.resize((224, 224), Image.BILINEAR)
+# img = img.convert('RGBA')
+
+gt = Image.open(r'D:\TransFuse-lits\results\rendergraph\gt2.png').convert('L')
+
+gt = np.array(gt)
+pad = np.zeros_like(gt)
+gt_red = np.stack((gt, pad, pad), axis=2)
+gt_red = Image.fromarray(gt_red).convert('RGBA')
+
+img_fuse2 = Image.blend(img, gt_red, 0.3)
+
+img_fuse2.save(r'D:\TransFuse-lits\results\rendergraph\f-gt2.png')
+
+
+
+
+
